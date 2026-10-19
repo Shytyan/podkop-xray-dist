@@ -1,2 +1,22 @@
-# podkop-xray-dist
-Podkop (Xray edition) for OpenWrt: installer and release packages
+# Podkop (Xray edition) — установка
+
+Готовые пакеты Podkop на ядре Xray-core для OpenWrt 24.10+ (opkg) и 25.12+ (apk).
+Исходный код в этом репозитории не публикуется — здесь только установщик и релизы.
+
+## Установка одной командой
+
+Выполните на роутере по SSH:
+
+```sh
+sh <(wget -O - https://raw.githubusercontent.com/Shytyan/podkop-xray-dist/main/install.sh)
+```
+
+Установщик:
+- удалит старый podkop (в том числе оригинальный на sing-box) и его настройки — копия конфига сохранится в `/etc/config/podkop.bak-<дата>`;
+- поставит зависимости и пакеты `podkop`, `luci-app-podkop` из последнего релиза;
+- спросит, ставить ли русский язык интерфейса (`luci-i18n-podkop-ru`), иначе останется английский;
+- поставит самую новую версию Xray-core.
+
+Параметры: `-y` — без вопросов (язык английский), `--ru` — сразу с русским языком.
+
+После установки откройте LuCI → Services → Podkop, добавьте ссылку на сервер и нажмите «Сохранить и применить».
