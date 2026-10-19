@@ -7,7 +7,7 @@
 
 set -e
 
-REPO="https://api.github.com/repos/Shytyan/podkop-xray-dist/releases/latest"
+RELEASE_DOWNLOAD="https://github.com/Shytyan/podkop-xray-dist/releases/latest/download"
 XRAY_REPO="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 XRAY_RELEASES="https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1"
 DOWNLOAD_DIR="/tmp/podkop_install"
@@ -225,7 +225,7 @@ confirm_wipe() {
 }
 
 purge_old_podkop() {
-    info "==> Step 3: Purging Old Podkop, Sing-box & Conflicting Components"
+    info "==> Step 4: Purging Old Podkop, Sing-box & Conflicting Components"
 
     # Backup existing config and remove for clean default install
     if [ -f /etc/config/podkop ]; then
@@ -285,7 +285,7 @@ purge_old_podkop() {
 }
 
 install_deps() {
-    info "==> Step 4: Installing System Dependencies"
+    info "==> Step 5: Installing System Dependencies"
     pkg_update
 
     local deps="curl jq bind-dig unzip kmod-nft-tproxy coreutils-base64 luci-base"
@@ -296,7 +296,7 @@ install_deps() {
 }
 
 install_xray() {
-    info "==> Step 6: Installing the latest Xray-core"
+    info "==> Step 7: Installing the latest Xray-core"
 
     local arch zip_arch
     arch="$(uname -m)"
@@ -341,6 +341,13 @@ install_xray() {
         latest_json="$(echo "$latest_json" | jq -c 'if type == "array" then .[0] else . end' 2>/dev/null || true)"
         tag_name="$(echo "$latest_json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
         download_url="$(echo "$latest_json" | jq -r --arg target "Xray-linux-${zip_arch}.zip" '.assets[]? | select(.name == $target) | .browser_download_url' 2>/dev/null || true)"
+    fi
+
+    # GitHub API unavailable (e.g. rate limit for a shared IP): newest tag from the releases feed, no API involved
+    if [ -z "$tag_name" ]; then
+        tag_name="$(curl -fsSL -m 15 "https://github.com/XTLS/Xray-core/releases.atom" 2>/dev/null |
+            grep -o 'releases/tag/v[0-9][0-9.]*' | head -n1 | sed 's|releases/tag/||')"
+        [ -n "$tag_name" ] && msg "GitHub API unavailable, newest Xray tag from the releases feed: $tag_name"
     fi
 
     if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
@@ -464,64 +471,51 @@ EOF
     fi
 }
 
-install_packages() {
-    info "==> Step 5: Installing Podkop (Xray edition) Packages"
+pkg_ext() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then echo apk; else echo ipk; fi
+}
 
+# Downloads the packages BEFORE the old podkop is removed: a failed download leaves the router untouched.
+# Release assets with fixed names are fetched via releases/latest/download (no GitHub API, no rate limit).
+fetch_packages() {
+    info "==> Step 3: Downloading Podkop (Xray edition) Packages"
+    local ext p
+    ext="$(pkg_ext)"
     rm -rf "$DOWNLOAD_DIR"
     mkdir -p "$DOWNLOAD_DIR"
 
-    local ext="ipk"
-    [ "$PKG_IS_APK" -eq 1 ] && ext="apk"
-
-    # PODKOP_PKG_DIR=<dir with .ipk/.apk> installs local packages (development/testing only)
-    if [ -n "$PODKOP_PKG_DIR" ]; then
-        msg "Using local packages from $PODKOP_PKG_DIR"
-        cp -f "$PODKOP_PKG_DIR"/*podkop*."$ext" "$DOWNLOAD_DIR/" || { err "Error: no *podkop*.$ext in $PODKOP_PKG_DIR"; exit 1; }
-    else
-        msg "Fetching release assets from $REPO..."
-        local release_json="" urls url fname
-        if command -v curl >/dev/null 2>&1; then
-            release_json="$(curl -fsSL -m 30 "$REPO" 2>/dev/null || true)"
+    for p in podkop luci-app-podkop luci-i18n-podkop-ru; do
+        if [ -n "$PODKOP_PKG_DIR" ]; then
+            # PODKOP_PKG_DIR=<dir with .ipk/.apk>: local packages (development/testing only)
+            local f
+            f="$(ls -1 "$PODKOP_PKG_DIR"/"$p"[-_.]*"$ext" 2>/dev/null | sort -V | tail -n1)"
+            [ -n "$f" ] && cp -f "$f" "$DOWNLOAD_DIR/$p.$ext"
         else
-            release_json="$(wget -qO- "$REPO" 2>/dev/null || true)"
+            msg "Downloading $p.$ext..."
+            fetch_file "$RELEASE_DOWNLOAD/$p.$ext" "$DOWNLOAD_DIR/$p.$ext" || rm -f "$DOWNLOAD_DIR/$p.$ext"
         fi
-        if echo "$release_json" | grep -q 'API rate limit'; then
-            err "Error: GitHub API rate limit reached. Repeat in a few minutes."
-            exit 1
-        fi
-        urls="$(echo "$release_json" | grep -o "https://[^\"[:space:]]*/releases/download/[^\"[:space:]]*\\.${ext}" | sort -u)"
-        if [ -z "$urls" ]; then
-            err "Error: no .$ext packages found in the latest release ($REPO)."
-            exit 1
-        fi
-        for url in $urls; do
-            fname="$(basename "$url")"
-            msg "Downloading $fname..."
-            if ! fetch_file "$url" "$DOWNLOAD_DIR/$fname"; then
-                err "Error: failed to download $url"
-                exit 1
-            fi
-        done
-    fi
+    done
 
-    # Install main packages (pick newest version if multiple exist)
-    local main_pkg=""
-    local luci_pkg=""
-    local ru_pkg=""
-
-    main_pkg="$(ls -1 "$DOWNLOAD_DIR"/podkop[-_]*."$ext" 2>/dev/null | sort -V | tail -n1)"
-    luci_pkg="$(ls -1 "$DOWNLOAD_DIR"/luci-app-podkop*."$ext" 2>/dev/null | sort -V | tail -n1)"
-    ru_pkg="$(ls -1 "$DOWNLOAD_DIR"/luci-i18n-podkop-ru*."$ext" 2>/dev/null | sort -V | tail -n1)"
-
-    if [ -z "$main_pkg" ] || [ -z "$luci_pkg" ]; then
-        err "Error: Required packages (podkop, luci-app-podkop) not found in $DOWNLOAD_DIR"
+    if [ ! -s "$DOWNLOAD_DIR/podkop.$ext" ] || [ ! -s "$DOWNLOAD_DIR/luci-app-podkop.$ext" ]; then
+        err "Error: could not download podkop/luci-app-podkop packages from $RELEASE_DOWNLOAD"
+        err "Nothing was changed on the router. Check the internet connection and try again."
         exit 1
     fi
+    msg "Packages downloaded."
+}
 
-    msg "Installing $(basename "$main_pkg")..."
+install_packages() {
+    info "==> Step 6: Installing Podkop (Xray edition) Packages"
+    local ext main_pkg luci_pkg ru_pkg
+    ext="$(pkg_ext)"
+    main_pkg="$DOWNLOAD_DIR/podkop.$ext"
+    luci_pkg="$DOWNLOAD_DIR/luci-app-podkop.$ext"
+    ru_pkg="$DOWNLOAD_DIR/luci-i18n-podkop-ru.$ext"
+
+    msg "Installing podkop..."
     pkg_install_file "$main_pkg"
 
-    msg "Installing $(basename "$luci_pkg")..."
+    msg "Installing luci-app-podkop..."
     pkg_install_file "$luci_pkg"
 
     # Russian language (separate luci-i18n-podkop-ru package, as in the original podkop)
@@ -541,11 +535,11 @@ install_packages() {
     fi
 
     if [ "$install_ru" -eq 1 ]; then
-        if [ -z "$ru_pkg" ]; then
-            err "Error: luci-i18n-podkop-ru package not found in the release."
+        if [ ! -s "$ru_pkg" ]; then
+            err "Error: luci-i18n-podkop-ru package was not downloaded."
             exit 1
         fi
-        msg "Installing $(basename "$ru_pkg")..."
+        msg "Installing luci-i18n-podkop-ru..."
         pkg_install_file "$ru_pkg"
         pkg_install_name "luci-i18n-base-ru" >/dev/null 2>&1 || warn "Warning: luci-i18n-base-ru is not installed (LuCI menus stay in English)"
         uci set luci.languages.ru='Русский (Russian)'
@@ -560,7 +554,7 @@ install_packages() {
 }
 
 post_install() {
-    info "==> Step 7: Finalizing Installation"
+    info "==> Step 8: Finalizing Installation"
 
     # Normalize line endings & permissions
     sed -i 's/\r$//' /usr/bin/podkop /etc/init.d/podkop /etc/init.d/xray /usr/lib/podkop/*.sh 2>/dev/null || true
@@ -598,6 +592,7 @@ post_install() {
 main() {
     check_system
     confirm_wipe
+    fetch_packages
     purge_old_podkop
     install_deps
     install_packages
