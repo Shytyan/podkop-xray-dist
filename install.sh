@@ -369,6 +369,15 @@ install_xray() {
         fi
     fi
 
+    # /tmp is RAM on OpenWrt: the archive (~12 MB) and the binary (~35 MB) must both fit
+    local tmp_free
+    tmp_free="$(df -k /tmp 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [ -n "$tmp_free" ] && [ "$tmp_free" -lt 61440 ]; then
+        err "Error: not enough free space in /tmp for Xray-core: $((tmp_free / 1024)) MB, need 60 MB."
+        err "podkop is installed and uses the xray-core package binary; free /tmp and run: podkop update_xray"
+        exit 1
+    fi
+
     msg "Downloading Xray-core from $download_url..."
     local tmp_zip="/tmp/xray.zip"
     local tmp_bin="/tmp/xray.new"
@@ -381,8 +390,16 @@ install_xray() {
     fi
 
     msg "Extracting Xray binary..."
-    unzip -p "$tmp_zip" xray > "$tmp_bin"
+    local want_size have_size
+    want_size="$(unzip -l "$tmp_zip" xray 2>/dev/null | awk '$NF == "xray" {print $1; exit}')"
+    unzip -p "$tmp_zip" xray > "$tmp_bin" || true
     rm -f "$tmp_zip"
+    have_size="$(wc -c < "$tmp_bin" 2>/dev/null | tr -d ' ')"
+    if [ -z "$want_size" ] || [ "$have_size" != "$want_size" ]; then
+        err "Error: Xray-core binary was not extracted completely ($have_size of $want_size bytes, /tmp full?)."
+        rm -f "$tmp_bin"
+        exit 1
+    fi
     chmod +x "$tmp_bin"
 
     # Validate binary
