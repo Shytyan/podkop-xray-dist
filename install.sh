@@ -14,6 +14,7 @@ DOWNLOAD_DIR="/tmp/podkop_install"
 REQUIRED_SPACE_KB=46080 # 45MB in KB
 NON_INTERACTIVE=0
 FORCE_RU=0
+XRAY_PRERELEASE=0
 
 # ANSI colors
 c_green='\033[32;1m'
@@ -47,9 +48,13 @@ for arg in "$@"; do
         --ru|ru)
             FORCE_RU=1
             ;;
+        --xray-prerelease)
+            XRAY_PRERELEASE=1
+            ;;
         -h|--help)
             echo "Usage: sh install.sh [-y] [--ru]"
             echo "  -y, --yes: Non-interactive mode (auto-confirm wipe and install)"
+            echo "  --xray-prerelease: Install the newest Xray-core including pre-releases (default: latest stable)"
             echo "  --ru:      Install the Russian language pack (luci-i18n-podkop-ru); with -y the default is English"
             exit 0
             ;;
@@ -332,10 +337,11 @@ install_xray() {
     local tag_name=""
     local latest_json=""
 
-    # Same source as `podkop update_xray`: the newest release including pre-releases, else the latest stable
+    # Same policy as `podkop update_xray`: latest stable by default, newest including pre-releases with --xray-prerelease
+    local api_url="$XRAY_REPO"
+    [ "$XRAY_PRERELEASE" -eq 1 ] && api_url="$XRAY_RELEASES"
     if command -v curl >/dev/null 2>&1; then
-        latest_json="$(curl -fsSL -m 15 "$XRAY_RELEASES" 2>/dev/null || true)"
-        echo "$latest_json" | grep -q '"tag_name"' || latest_json="$(curl -fsSL -m 15 "$XRAY_REPO" 2>/dev/null || true)"
+        latest_json="$(curl -fsSL -m 15 "$api_url" 2>/dev/null || true)"
     fi
     if [ -n "$latest_json" ] && echo "$latest_json" | grep -q '"tag_name"'; then
         latest_json="$(echo "$latest_json" | jq -c 'if type == "array" then .[0] else . end' 2>/dev/null || true)"
@@ -343,11 +349,16 @@ install_xray() {
         download_url="$(echo "$latest_json" | jq -r --arg target "Xray-linux-${zip_arch}.zip" '.assets[]? | select(.name == $target) | .browser_download_url' 2>/dev/null || true)"
     fi
 
-    # GitHub API unavailable (e.g. rate limit for a shared IP): newest tag from the releases feed, no API involved
+    # GitHub API unavailable (e.g. rate limit for a shared IP): github.com pages, no API involved
     if [ -z "$tag_name" ]; then
-        tag_name="$(curl -fsSL -m 15 "https://github.com/XTLS/Xray-core/releases.atom" 2>/dev/null |
-            grep -o 'releases/tag/v[0-9][0-9.]*' | head -n1 | sed 's|releases/tag/||')"
-        [ -n "$tag_name" ] && msg "GitHub API unavailable, newest Xray tag from the releases feed: $tag_name"
+        if [ "$XRAY_PRERELEASE" -eq 1 ]; then
+            tag_name="$(curl -fsSL -m 15 "https://github.com/XTLS/Xray-core/releases.atom" 2>/dev/null |
+                grep -o 'releases/tag/v[0-9][0-9.]*' | head -n1 | sed 's|releases/tag/||')"
+        else
+            tag_name="$(curl -sI -m 15 "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null | tr -d '\r' |
+                sed -n 's|^[Ll]ocation: .*/releases/tag/\(v[0-9][0-9.]*\).*|\1|p' | head -n1)"
+        fi
+        [ -n "$tag_name" ] && msg "GitHub API unavailable, Xray tag from github.com: $tag_name"
     fi
 
     if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
@@ -598,6 +609,7 @@ main() {
     install_packages
     # after the packages: the xray-core dependency would overwrite a newer binary
     install_xray
+    [ "$XRAY_PRERELEASE" -eq 1 ] && uci -q set podkop.settings.xray_prerelease='1' && uci -q commit podkop
     post_install
 }
 
