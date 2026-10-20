@@ -611,6 +611,7 @@ post_install() {
     info "• Ядро Xray:     $xray_ver"
     info "• Веб-интерфейс: http://$(uci -q get network.lan.ipaddr || echo "192.168.1.1")/cgi-bin/luci/admin/services/podkop"
     echo ""
+    warn "Если LuCI уже был открыт, обновите страницу с Ctrl+F5: браузер кеширует старый интерфейс."
     warn "ВАЖНО: Служба Podkop не запущена автоматически."
     warn "Для запуска откройте веб-интерфейс LuCI, добавьте Outbound (Single Link: VLESS/VMess/Trojan/SS)"
     warn "и нажмите 'Сохранить и применить'."
