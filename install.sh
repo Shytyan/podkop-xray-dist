@@ -15,6 +15,7 @@ REQUIRED_SPACE_KB=46080 # 45MB in KB
 NON_INTERACTIVE=0
 FORCE_RU=0
 XRAY_PRERELEASE=0
+NO_DOH_PROXY=0
 
 # ANSI colors
 c_green='\033[32;1m'
@@ -51,10 +52,14 @@ for arg in "$@"; do
         --xray-prerelease)
             XRAY_PRERELEASE=1
             ;;
+        --no-doh-proxy)
+            NO_DOH_PROXY=1
+            ;;
         -h|--help)
             echo "Usage: sh install.sh [-y] [--ru]"
             echo "  -y, --yes: Non-interactive mode (auto-confirm wipe and install)"
             echo "  --xray-prerelease: Install the newest Xray-core including pre-releases (default: latest stable)"
+            echo "  --no-doh-proxy: Do not install https-dns-proxy (DNS queries other than A/AAAA then go through the proxy to 1.1.1.1)"
             echo "  --ru:      Install the Russian language pack (luci-i18n-podkop-ru); with -y the default is English"
             exit 0
             ;;
@@ -103,8 +108,9 @@ pkg_install_file() {
 fetch_file() {
     local url="$1" out="$2"
     rm -f "$out"
+    # up to 10 minutes per attempt: the ~20 MB Xray archive over a slow link
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 2 -m 180 -o "$out" "$url" || { rm -f "$out"; return 1; }
+        curl -fsSL --retry 1 --connect-timeout 15 -m 600 -o "$out" "$url" || { rm -f "$out"; return 1; }
     else
         wget -q -O "$out" "$url" || { rm -f "$out"; return 1; }
     fi
@@ -581,6 +587,40 @@ install_packages() {
     rm -rf "$DOWNLOAD_DIR"
 }
 
+# Local DoH proxy: DNS queries Xray cannot send over DoH (TXT, MX, SRV...) go to the main DoH server through it,
+# so DNS leak tests show only the user's resolver. podkop runs it itself; the package service stays disabled.
+# The config goes first: the package defaults would start it, take over dnsmasq and intercept port 53.
+install_doh_proxy() {
+    [ "$NO_DOH_PROXY" -eq 1 ] && return 0
+    info "==> Step 7b: Installing https-dns-proxy (DNS queries other than A/AAAA over DoH)"
+    if [ -x /usr/sbin/https-dns-proxy ]; then
+        msg "https-dns-proxy is already installed, its configuration is left as is"
+        return 0
+    fi
+    # A config left by an earlier https-dns-proxy (removed during the purge) may take over dnsmasq: back it up
+    if [ -f /etc/config/https-dns-proxy ] && ! grep -q "Managed by podkop" /etc/config/https-dns-proxy; then
+        mv /etc/config/https-dns-proxy "/etc/config/https-dns-proxy.bak-$(date +%Y%m%d-%H%M%S)"
+        msg "Old https-dns-proxy configuration saved as /etc/config/https-dns-proxy.bak-<date>"
+    fi
+    if [ ! -f /etc/config/https-dns-proxy ]; then
+        cat > /etc/config/https-dns-proxy <<'EOF'
+# Managed by podkop: the package service stays disabled, podkop runs https-dns-proxy itself.
+# No instances, no dnsmasq changes, no DNS hijacking.
+config main 'config'
+	option dnsmasq_config_update '-'
+	option force_dns '0'
+	option procd_trigger_wan6 '0'
+EOF
+    fi
+    if ! pkg_install_name https-dns-proxy; then
+        warn "Warning: https-dns-proxy is not installed: DNS queries other than A/AAAA will go through the proxy to 1.1.1.1"
+        return 0
+    fi
+    /etc/init.d/https-dns-proxy stop >/dev/null 2>&1 || true
+    /etc/init.d/https-dns-proxy disable >/dev/null 2>&1 || true
+    msg "https-dns-proxy installed (started by podkop when the main DNS is DoH)"
+}
+
 post_install() {
     info "==> Step 8: Finalizing Installation"
 
@@ -627,6 +667,7 @@ main() {
     install_packages
     # after the packages: the xray-core dependency would overwrite a newer binary
     install_xray
+    install_doh_proxy
     [ "$XRAY_PRERELEASE" -eq 1 ] && uci -q set podkop.settings.xray_prerelease='1' && uci -q commit podkop
     post_install
 }
