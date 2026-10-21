@@ -14,7 +14,10 @@ DOWNLOAD_DIR="/tmp/podkop_install"
 REQUIRED_SPACE_KB=46080 # 45MB in KB
 NON_INTERACTIVE=0
 FORCE_RU=0
-XRAY_PRERELEASE=0
+# Xray-core release podkop is tested with; installed by default (see install_xray)
+XRAY_PINNED_VERSION="v26.10.21"
+XRAY_MODE="pinned" # pinned | latest | prerelease | version
+XRAY_VERSION=""
 NO_DOH_PROXY=0
 
 # ANSI colors
@@ -50,7 +53,15 @@ for arg in "$@"; do
             FORCE_RU=1
             ;;
         --xray-prerelease)
-            XRAY_PRERELEASE=1
+            XRAY_MODE="prerelease"
+            ;;
+        --xray-latest)
+            XRAY_MODE="latest"
+            ;;
+        --xray-version=*)
+            XRAY_MODE="version"
+            XRAY_VERSION="${arg#--xray-version=}"
+            XRAY_VERSION="v${XRAY_VERSION#v}"
             ;;
         --no-doh-proxy)
             NO_DOH_PROXY=1
@@ -58,7 +69,9 @@ for arg in "$@"; do
         -h|--help)
             echo "Usage: sh install.sh [-y] [--ru]"
             echo "  -y, --yes: Non-interactive mode (auto-confirm wipe and install)"
-            echo "  --xray-prerelease: Install the newest Xray-core including pre-releases (default: latest stable)"
+            echo "  --xray-latest: Install the latest stable Xray-core (default: the version podkop is tested with)"
+            echo "  --xray-prerelease: Install the newest Xray-core including pre-releases"
+            echo "  --xray-version=X: Install the given Xray-core version, e.g. --xray-version=26.3.27"
             echo "  --no-doh-proxy: Do not install https-dns-proxy (DNS queries other than A/AAAA then go through the proxy to 1.1.1.1)"
             echo "  --ru:      Install the Russian language pack (luci-i18n-podkop-ru); with -y the default is English"
             exit 0
@@ -306,8 +319,84 @@ install_deps() {
     done
 }
 
+# Tag of the newest Xray-core release: stable, or including pre-releases with --xray-prerelease.
+# GitHub API first, then github.com pages (API rate limit for a shared IP).
+xray_latest_tag() {
+    local api_url="$XRAY_REPO" json tag=""
+    [ "$XRAY_MODE" = "prerelease" ] && api_url="$XRAY_RELEASES"
+    json="$(curl -fsSL -m 15 "$api_url" 2>/dev/null || true)"
+    tag="$(echo "$json" | jq -r 'if type == "array" then .[0].tag_name else .tag_name end // empty' 2>/dev/null || true)"
+    if [ -z "$tag" ]; then
+        if [ "$XRAY_MODE" = "prerelease" ]; then
+            tag="$(curl -fsSL -m 15 "https://github.com/XTLS/Xray-core/releases.atom" 2>/dev/null |
+                grep -o 'releases/tag/v[0-9][0-9.]*' | head -n1 | sed 's|releases/tag/||')"
+        else
+            tag="$(curl -sI -m 15 "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null | tr -d '\r' |
+                sed -n 's|^[Ll]ocation: .*/releases/tag/\(v[0-9][0-9.]*\).*|\1|p' | head -n1)"
+        fi
+    fi
+    echo "$tag"
+}
+
+# xray_fetch_binary <zip url> <file>: downloads the archive, extracts a complete, runnable xray binary
+xray_fetch_binary() {
+    local url="$1" out="$2" tmp_zip="/tmp/xray.zip" want_size have_size
+    rm -f "$tmp_zip" "$out"
+    msg "Downloading Xray-core from $url..."
+    fetch_file "$url" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
+    want_size="$(unzip -l "$tmp_zip" xray 2>/dev/null | awk '$NF == "xray" {print $1; exit}')"
+    unzip -p "$tmp_zip" xray > "$out" 2>/dev/null || true
+    rm -f "$tmp_zip"
+    have_size="$(wc -c < "$out" 2>/dev/null | tr -d ' ')"
+    if [ -z "$want_size" ] || [ "$have_size" != "$want_size" ]; then
+        err "Error: Xray-core binary was not extracted completely ($have_size of $want_size bytes, /tmp full?)."
+        rm -f "$out"
+        return 1
+    fi
+    chmod +x "$out"
+    if [ -z "$("$out" version 2>/dev/null | head -n1)" ]; then
+        err "Error: Downloaded Xray-core binary failed execution check."
+        rm -f "$out"
+        return 1
+    fi
+}
+
+# xray_download <zip arch> <file>: a working xray binary of the chosen version. Default: the release podkop is
+# tested with (XRAY_PINNED_VERSION); if XTLS removes it, the copy in our latest release (the release workflow
+# mirrors it), then the latest stable release.
+xray_download() {
+    local zip_arch="$1" out="$2" urls url tag_name
+    case "$XRAY_MODE" in
+        pinned)
+            msg "Xray-core version tested with podkop: $XRAY_PINNED_VERSION"
+            urls="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PINNED_VERSION}/Xray-linux-${zip_arch}.zip"
+            urls="$urls ${RELEASE_DOWNLOAD}/Xray-linux-${zip_arch}.zip latest"
+            ;;
+        version)
+            urls="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${zip_arch}.zip"
+            ;;
+        *)
+            urls="latest"
+            ;;
+    esac
+    for url in $urls; do
+        if [ "$url" = "latest" ]; then
+            [ "$XRAY_MODE" = "pinned" ] && warn "Warning: Xray-core $XRAY_PINNED_VERSION is not available, installing the latest stable release"
+            tag_name="$(xray_latest_tag)"
+            if [ -n "$tag_name" ]; then
+                url="https://github.com/XTLS/Xray-core/releases/download/${tag_name}/Xray-linux-${zip_arch}.zip"
+            else
+                url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${zip_arch}.zip"
+            fi
+        fi
+        xray_fetch_binary "$url" "$out" && return 0
+        warn "Warning: Xray-core is not available at $url"
+    done
+    return 1
+}
+
 install_xray() {
-    info "==> Step 7: Installing the latest Xray-core"
+    info "==> Step 7: Installing Xray-core"
 
     local arch zip_arch
     arch="$(uname -m)"
@@ -338,43 +427,6 @@ install_xray() {
 
     msg "Detected architecture: $arch -> Xray-linux-${zip_arch}.zip"
 
-    # Query latest release
-    local download_url=""
-    local tag_name=""
-    local latest_json=""
-
-    # Same policy as `podkop update_xray`: latest stable by default, newest including pre-releases with --xray-prerelease
-    local api_url="$XRAY_REPO"
-    [ "$XRAY_PRERELEASE" -eq 1 ] && api_url="$XRAY_RELEASES"
-    if command -v curl >/dev/null 2>&1; then
-        latest_json="$(curl -fsSL -m 15 "$api_url" 2>/dev/null || true)"
-    fi
-    if [ -n "$latest_json" ] && echo "$latest_json" | grep -q '"tag_name"'; then
-        latest_json="$(echo "$latest_json" | jq -c 'if type == "array" then .[0] else . end' 2>/dev/null || true)"
-        tag_name="$(echo "$latest_json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
-        download_url="$(echo "$latest_json" | jq -r --arg target "Xray-linux-${zip_arch}.zip" '.assets[]? | select(.name == $target) | .browser_download_url' 2>/dev/null || true)"
-    fi
-
-    # GitHub API unavailable (e.g. rate limit for a shared IP): github.com pages, no API involved
-    if [ -z "$tag_name" ]; then
-        if [ "$XRAY_PRERELEASE" -eq 1 ]; then
-            tag_name="$(curl -fsSL -m 15 "https://github.com/XTLS/Xray-core/releases.atom" 2>/dev/null |
-                grep -o 'releases/tag/v[0-9][0-9.]*' | head -n1 | sed 's|releases/tag/||')"
-        else
-            tag_name="$(curl -sI -m 15 "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null | tr -d '\r' |
-                sed -n 's|^[Ll]ocation: .*/releases/tag/\(v[0-9][0-9.]*\).*|\1|p' | head -n1)"
-        fi
-        [ -n "$tag_name" ] && msg "GitHub API unavailable, Xray tag from github.com: $tag_name"
-    fi
-
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        if [ -n "$tag_name" ]; then
-            download_url="https://github.com/XTLS/Xray-core/releases/download/${tag_name}/Xray-linux-${zip_arch}.zip"
-        else
-            download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${zip_arch}.zip"
-        fi
-    fi
-
     # /tmp is RAM on OpenWrt: the archive (~12 MB) and the binary (~35 MB) must both fit
     local tmp_free
     tmp_free="$(df -k /tmp 2>/dev/null | awk 'NR==2 {print $4}')"
@@ -384,38 +436,12 @@ install_xray() {
         exit 1
     fi
 
-    msg "Downloading Xray-core from $download_url..."
-    local tmp_zip="/tmp/xray.zip"
-    local tmp_bin="/tmp/xray.new"
-    rm -f "$tmp_zip" "$tmp_bin"
-
-    if ! fetch_file "$download_url" "$tmp_zip"; then
-        err "Error: Failed to download Xray-core archive."
-        rm -f "$tmp_zip"
+    local tmp_bin="/tmp/xray.new" xray_ver
+    if ! xray_download "$zip_arch" "$tmp_bin"; then
+        err "Error: Failed to download a working Xray-core binary."
         exit 1
     fi
-
-    msg "Extracting Xray binary..."
-    local want_size have_size
-    want_size="$(unzip -l "$tmp_zip" xray 2>/dev/null | awk '$NF == "xray" {print $1; exit}')"
-    unzip -p "$tmp_zip" xray > "$tmp_bin" || true
-    rm -f "$tmp_zip"
-    have_size="$(wc -c < "$tmp_bin" 2>/dev/null | tr -d ' ')"
-    if [ -z "$want_size" ] || [ "$have_size" != "$want_size" ]; then
-        err "Error: Xray-core binary was not extracted completely ($have_size of $want_size bytes, /tmp full?)."
-        rm -f "$tmp_bin"
-        exit 1
-    fi
-    chmod +x "$tmp_bin"
-
-    # Validate binary
-    local xray_ver
     xray_ver="$("$tmp_bin" version 2>/dev/null | head -n1 | awk '{print $2}')"
-    if [ -z "$xray_ver" ]; then
-        err "Error: Downloaded Xray-core binary failed execution check."
-        rm -f "$tmp_bin"
-        exit 1
-    fi
 
     mv -f "$tmp_bin" /usr/bin/xray
     msg "Installed Xray-core $xray_ver to /usr/bin/xray"
@@ -668,8 +694,9 @@ main() {
     # after the packages: the xray-core dependency would overwrite a newer binary
     install_xray
     install_doh_proxy
-    [ "$XRAY_PRERELEASE" -eq 1 ] && uci -q set podkop.settings.xray_prerelease='1' && uci -q commit podkop
+    [ "$XRAY_MODE" = "prerelease" ] && uci -q set podkop.settings.xray_prerelease='1' && uci -q commit podkop
     post_install
 }
 
-main "$@"
+# PODKOP_INSTALL_NO_MAIN=1: only define the functions (tools/test_install_xray.sh)
+[ -n "$PODKOP_INSTALL_NO_MAIN" ] || main "$@"
