@@ -12,6 +12,8 @@ sh <(wget -O - https://raw.githubusercontent.com/Shytyan/podkop-xray-dist/main/i
 
 Установщик заменит старый podkop (копия настроек — `/etc/config/podkop.bak-<дата>`), поставит пакеты из последнего релиза и проверенную версию Xray-core.
 
+Если провайдер блокирует github.com, установщик сам скачает пакеты и Xray-core через api.github.com (с проверкой sha256).
+
 Параметры:
 
 | | |
