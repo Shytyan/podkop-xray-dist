@@ -8,6 +8,9 @@
 set -e
 
 RELEASE_DOWNLOAD="https://github.com/Shytyan/podkop-xray-dist/releases/latest/download"
+RELEASE_API="https://api.github.com/repos/Shytyan/podkop-xray-dist/releases/latest"
+RELEASE_JSON="/tmp/podkop_release.json"
+GITHUB_BLOCKED=0 # set once github.com fails and the api.github.com route works
 XRAY_REPO="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 XRAY_RELEASES="https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1"
 DOWNLOAD_DIR="/tmp/podkop_install"
@@ -128,6 +131,49 @@ fetch_file() {
         wget -q -O "$out" "$url" || { rm -f "$out"; return 1; }
     fi
     [ -s "$out" ]
+}
+
+# release_asset_info <name>: "<api url> <sha256>" of an asset of our latest release (from the GitHub API)
+release_asset_info() {
+    local name="$1"
+    if [ ! -s "$RELEASE_JSON" ]; then
+        curl -fsSL --connect-timeout 15 -m 60 -o "$RELEASE_JSON" "$RELEASE_API" 2>/dev/null || { rm -f "$RELEASE_JSON"; return 1; }
+    fi
+    tr ',{}' '\n\n\n' < "$RELEASE_JSON" | awk -v want="$name" '
+        /"url": *"https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\/[0-9]+"/ {
+            if (found) exit
+            url = $0; sub(/^[^:]*: *"/, "", url); sub(/".*/, "", url)
+        }
+        /"name": *"/ { n = $0; sub(/^[^:]*: *"/, "", n); sub(/".*/, "", n); if (n == want && url != "") found = 1 }
+        found && /"digest": *"sha256:/ { d = $0; sub(/.*sha256:/, "", d); sub(/".*/, "", d); print url, d; done = 1; exit }
+        END { if (found && !done) print url, "" }'
+}
+
+# fetch_release_asset <name> <file>: an asset of our latest release. github.com first; if it is blocked
+# (some ISPs block github.com:443 but not *.githubusercontent.com), the GitHub API, which redirects to
+# release-assets.githubusercontent.com. That needs curl (Accept header); the file is checked against the API sha256.
+fetch_release_asset() {
+    local name="$1" out="$2" info url sum
+    [ "$GITHUB_BLOCKED" -eq 0 ] && fetch_file "$RELEASE_DOWNLOAD/$name" "$out" && return 0
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "github.com is not reachable, installing curl to download through api.github.com..."
+        pkg_update
+        pkg_install_name curl >/dev/null 2>&1 || return 1
+    fi
+    info="$(release_asset_info "$name" || true)"
+    url="${info% *}"
+    sum="${info#* }"
+    [ -n "$url" ] || return 1
+    [ "$GITHUB_BLOCKED" -eq 1 ] || warn "github.com is not reachable, downloading through api.github.com"
+    rm -f "$out"
+    curl -fsSL --retry 1 --connect-timeout 15 -m 600 -H "Accept: application/octet-stream" -o "$out" "$url" || { rm -f "$out"; return 1; }
+    [ -s "$out" ] || return 1
+    if [ -n "$sum" ] && command -v sha256sum >/dev/null 2>&1 && [ "$(sha256sum "$out" | awk '{print $1}')" != "$sum" ]; then
+        err "Error: checksum mismatch for $name"
+        rm -f "$out"
+        return 1
+    fi
+    GITHUB_BLOCKED=1
 }
 
 pkg_remove() {
@@ -338,12 +384,20 @@ xray_latest_tag() {
     echo "$tag"
 }
 
-# xray_fetch_binary <zip url> <file>: downloads the archive, extracts a complete, runnable xray binary
+# xray_fetch_binary <zip url | mirror:<asset name>> <file>: downloads the archive, extracts a complete, runnable xray binary
 xray_fetch_binary() {
     local url="$1" out="$2" tmp_zip="/tmp/xray.zip" want_size have_size
     rm -f "$tmp_zip" "$out"
-    msg "Downloading Xray-core from $url..."
-    fetch_file "$url" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
+    case "$url" in
+        mirror:*)
+            msg "Downloading Xray-core ${url#mirror:} from the podkop release..."
+            fetch_release_asset "${url#mirror:}" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
+            ;;
+        *)
+            msg "Downloading Xray-core from $url..."
+            fetch_file "$url" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
+            ;;
+    esac
     want_size="$(unzip -l "$tmp_zip" xray 2>/dev/null | awk '$NF == "xray" {print $1; exit}')"
     unzip -p "$tmp_zip" xray > "$out" 2>/dev/null || true
     rm -f "$tmp_zip"
@@ -370,7 +424,7 @@ xray_download() {
         pinned)
             msg "Xray-core version tested with podkop: $XRAY_PINNED_VERSION"
             urls="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PINNED_VERSION}/Xray-linux-${zip_arch}.zip"
-            urls="$urls ${RELEASE_DOWNLOAD}/Xray-linux-${zip_arch}.zip latest"
+            urls="$urls mirror:Xray-linux-${zip_arch}.zip latest"
             ;;
         version)
             urls="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${zip_arch}.zip"
@@ -380,6 +434,8 @@ xray_download() {
             ;;
     esac
     for url in $urls; do
+        # github.com is blocked: only the mirror (through api.github.com) can work
+        [ "$GITHUB_BLOCKED" -eq 1 ] && [ "${url#mirror:}" = "$url" ] && continue
         if [ "$url" = "latest" ]; then
             [ "$XRAY_MODE" = "pinned" ] && warn "Warning: Xray-core $XRAY_PINNED_VERSION is not available, installing the latest stable release"
             tag_name="$(xray_latest_tag)"
@@ -552,12 +608,13 @@ fetch_packages() {
             [ -n "$f" ] && cp -f "$f" "$DOWNLOAD_DIR/$p.$ext"
         else
             msg "Downloading $p.$ext..."
-            fetch_file "$RELEASE_DOWNLOAD/$p.$ext" "$DOWNLOAD_DIR/$p.$ext" || rm -f "$DOWNLOAD_DIR/$p.$ext"
+            fetch_release_asset "$p.$ext" "$DOWNLOAD_DIR/$p.$ext" || rm -f "$DOWNLOAD_DIR/$p.$ext"
         fi
     done
 
     if [ ! -s "$DOWNLOAD_DIR/podkop.$ext" ] || [ ! -s "$DOWNLOAD_DIR/luci-app-podkop.$ext" ]; then
-        err "Error: could not download podkop/luci-app-podkop packages from $RELEASE_DOWNLOAD"
+        err "Error: could not download podkop/luci-app-podkop packages from $RELEASE_DOWNLOAD (or through api.github.com)"
+        err "Check that the router can open https://github.com and https://api.github.com (some ISPs block github.com)."
         err "Nothing was changed on the router. Check the internet connection and try again."
         exit 1
     fi
@@ -649,6 +706,7 @@ EOF
 
 post_install() {
     info "==> Step 8: Finalizing Installation"
+    rm -f "$RELEASE_JSON"
 
     # Normalize line endings & permissions
     sed -i 's/\r$//' /usr/bin/podkop /etc/init.d/podkop /etc/init.d/xray /usr/lib/podkop/*.sh 2>/dev/null || true
