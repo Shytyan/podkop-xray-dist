@@ -7,20 +7,18 @@
 
 set -e
 
+# Optional own mirror of the release files (tried before GitHub); empty in the published installer
+MIRROR_BASE="${MIRROR_BASE:-}"
 RELEASE_DOWNLOAD="https://github.com/Shytyan/podkop-xray-dist/releases/latest/download"
 RELEASE_API="https://api.github.com/repos/Shytyan/podkop-xray-dist/releases/latest"
 RELEASE_JSON="/tmp/podkop_release.json"
 GITHUB_BLOCKED=0 # set once github.com fails and the api.github.com route works
-XRAY_REPO="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-XRAY_RELEASES="https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1"
 DOWNLOAD_DIR="/tmp/podkop_install"
 REQUIRED_SPACE_KB=46080 # 45MB in KB
 NON_INTERACTIVE=0
 FORCE_RU=0
-# Xray-core release podkop is tested with; installed by default (see install_xray)
-XRAY_PINNED_VERSION="v26.10.21"
-XRAY_MODE="pinned" # pinned | latest | prerelease | version
-XRAY_VERSION=""
+# The Xray-core version podkop uses (see install_xray)
+XRAY_VERSION="v26.10.31"
 NO_DOH_PROXY=0
 
 # ANSI colors
@@ -55,26 +53,12 @@ for arg in "$@"; do
         --ru|ru)
             FORCE_RU=1
             ;;
-        --xray-prerelease)
-            XRAY_MODE="prerelease"
-            ;;
-        --xray-latest)
-            XRAY_MODE="latest"
-            ;;
-        --xray-version=*)
-            XRAY_MODE="version"
-            XRAY_VERSION="${arg#--xray-version=}"
-            XRAY_VERSION="v${XRAY_VERSION#v}"
-            ;;
         --no-doh-proxy)
             NO_DOH_PROXY=1
             ;;
         -h|--help)
             echo "Usage: sh install.sh [-y] [--ru]"
             echo "  -y, --yes: Non-interactive mode (auto-confirm wipe and install)"
-            echo "  --xray-latest: Install the latest stable Xray-core (default: the version podkop is tested with)"
-            echo "  --xray-prerelease: Install the newest Xray-core including pre-releases"
-            echo "  --xray-version=X: Install the given Xray-core version, e.g. --xray-version=26.3.27"
             echo "  --no-doh-proxy: Do not install https-dns-proxy (DNS queries other than A/AAAA then go through the proxy to 1.1.1.1)"
             echo "  --ru:      Install the Russian language pack (luci-i18n-podkop-ru); with -y the default is English"
             exit 0
@@ -149,11 +133,13 @@ release_asset_info() {
         END { if (found && !done) print url, "" }'
 }
 
-# fetch_release_asset <name> <file>: an asset of our latest release. github.com first; if it is blocked
-# (some ISPs block github.com:443 but not *.githubusercontent.com), the GitHub API, which redirects to
-# release-assets.githubusercontent.com. That needs curl (Accept header); the file is checked against the API sha256.
+# fetch_release_asset <name> <file>: an asset of our latest release. Our mirror (MIRROR_BASE) first, then
+# github.com; if github.com is blocked (some ISPs block github.com:443 but not *.githubusercontent.com), the
+# GitHub API, which redirects to release-assets.githubusercontent.com. That needs curl (Accept header); the file
+# is checked against the API sha256.
 fetch_release_asset() {
     local name="$1" out="$2" info url sum
+    [ -n "$MIRROR_BASE" ] && fetch_file "${MIRROR_BASE%/}/releases/latest/$name" "$out" && return 0
     [ "$GITHUB_BLOCKED" -eq 0 ] && fetch_file "$RELEASE_DOWNLOAD/$name" "$out" && return 0
     if ! command -v curl >/dev/null 2>&1; then
         warn "github.com is not reachable, installing curl to download through api.github.com..."
@@ -182,6 +168,14 @@ pkg_remove() {
         apk del "$pkg_name" 2>/dev/null || true
     else
         opkg remove --force-depends "$pkg_name" 2>/dev/null || true
+    fi
+}
+
+pkg_list_installed() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk info 2>/dev/null || true
+    else
+        opkg list-installed 2>/dev/null | awk '{print $1}' || true
     fi
 }
 
@@ -294,6 +288,131 @@ confirm_wipe() {
     esac
 }
 
+# M6: Bulletproof purge of sing-box of any origin (official/custom packages, running processes,
+# init scripts, and custom/renamed binaries detected by filename or by the sing-box Go module path inside).
+# Nothing is executed: a renamed build is recognised as an ELF file containing "sing-box" (every build embeds
+# github.com/sagernet/sing-box or its fork path); scripts that merely mention sing-box are left alone.
+is_singbox_binary() {
+    local f="$1" base
+    [ -f "$f" ] && [ -x "$f" ] && [ ! -L "$f" ] || return 1
+    base="$(basename "$f")"
+    case "$base" in
+        busybox|apk|opkg|xray|podkop|podkop-guard|curl|wget|jq|dig|unzip|nft|ip|tc|ss|uhttpd|rpcd|ubus|ubusd|procd|netifd|dnsmasq|odhcpd|dropbear|https-dns-proxy|sh|ash|bash|lua|ucode|fw4|iptables*|ip6tables*)
+            return 1
+            ;;
+        *sing-box*|*singbox*)
+            return 0
+            ;;
+    esac
+    [ "$(head -c 4 "$f" 2>/dev/null)" = "$(printf '\177ELF')" ] || return 1
+    grep -qa "sing-box" "$f" 2>/dev/null
+}
+
+purge_singbox_everywhere() {
+    local root="${PODKOP_PURGE_ROOT:-}" before_kb=0 after_kb=0 freed_kb=0
+    local p pid exe cmdline f d init_f rc_f sb_bins="" removed_items=""
+
+    if [ -z "$root" ]; then
+        if [ -d /overlay ]; then
+            before_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')"
+        else
+            before_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')"
+        fi
+    fi
+
+    # 1. Kill running sing-box processes (by /proc/<pid>/exe or /proc/<pid>/cmdline)
+    if [ -z "$root" ] && [ -d /proc ]; then
+        for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+            [ "$pid" = "$$" ] && continue
+            exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            case "$exe $cmdline" in
+                *sing-box*|*singbox*)
+                    kill -9 "$pid" 2>/dev/null || true
+                    removed_items="$removed_items proc:$pid"
+                    ;;
+            esac
+        done
+    fi
+
+    # 2. Remove any installed packages matching *sing-box* or *singbox*
+    for p in $(pkg_list_installed); do
+        case "$p" in
+            *sing-box*|*singbox*)
+                pkg_remove "$p"
+                removed_items="$removed_items pkg:$p"
+                ;;
+        esac
+    done
+
+    # 3. Scan executable directories for custom or renamed sing-box binaries
+    for d in "$root/usr/bin" "$root/usr/sbin" "$root/usr/local/bin" "$root/usr/local/sbin" \
+             "$root/opt" "$root/root" "$root/sbin" "$root/bin" \
+             "$root/overlay/upper/usr/bin" "$root/overlay/upper/usr/sbin" "$root/overlay/upper/opt" "$root/overlay/upper/root"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*; do
+            [ -e "$f" ] || continue
+            if is_singbox_binary "$f"; then
+                sb_bins="$sb_bins $f"
+                 [ -n "$root" ] && sb_bins="$sb_bins ${f#$root}"
+                rm -f "$f" 2>/dev/null || true
+                removed_items="$removed_items bin:$f"
+            fi
+        done
+    done
+
+    # 4. Stop, disable and remove init.d / rc.d scripts referencing sing-box or the removed binaries
+    if [ -d "$root/etc/init.d" ]; then
+        for init_f in "$root/etc/init.d"/*; do
+            [ -f "$init_f" ] || continue
+            local match=0
+            case "$(basename "$init_f")" in
+                *sing-box*|*singbox*) match=1 ;;
+            esac
+            if [ "$match" -eq 0 ] && grep -qE 'sing-?box' "$init_f" 2>/dev/null; then
+                match=1
+            fi
+            if [ "$match" -eq 0 ] && [ -n "$sb_bins" ]; then
+                for f in $sb_bins; do
+                    grep -qF "$f" "$init_f" 2>/dev/null && match=1 && break
+                done
+            fi
+            if [ "$match" -eq 1 ]; then
+                [ -z "$root" ] && "$init_f" stop >/dev/null 2>&1 || true
+                [ -z "$root" ] && "$init_f" disable >/dev/null 2>&1 || true
+                for rc_f in "$root/etc/rc.d"/*"$("basename" "$init_f")"; do
+                    [ -e "$rc_f" ] || [ -L "$rc_f" ] && rm -f "$rc_f" 2>/dev/null || true
+                done
+                rm -f "$init_f" 2>/dev/null || true
+                removed_items="$removed_items init:$init_f"
+            fi
+        done
+    fi
+
+    # 5. Remove leftover *sing-box* / *singbox* files & dirs across standard paths and overlay
+    for d in "$root/etc" "$root/usr" "$root/opt" "$root/root" "$root/tmp" "$root/var" "$root/overlay/upper"; do
+        [ -d "$d" ] || continue
+        find "$d" \( -name '*sing-box*' -o -name '*singbox*' -o -name '*.srs' \) -exec rm -rf {} + 2>/dev/null || true
+    done
+
+    if [ -z "$root" ]; then
+        if [ -d /overlay ]; then
+            after_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')"
+        else
+            after_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')"
+        fi
+        if [ -n "$before_kb" ] && [ -n "$after_kb" ] && [ "$after_kb" -gt "$before_kb" ] 2>/dev/null; then
+            freed_kb=$((after_kb - before_kb))
+        fi
+    fi
+
+    if [ -n "$removed_items" ]; then
+        msg "Sing-box purge removed:${removed_items} (freed $((freed_kb / 1024)) MB / ${freed_kb} KB)"
+    else
+        msg "Sing-box purge: no sing-box packages or binaries found (freed 0 KB)"
+    fi
+}
+
 purge_old_podkop() {
     info "==> Step 4: Purging Old Podkop, Sing-box & Conflicting Components"
 
@@ -325,7 +444,7 @@ purge_old_podkop() {
         /etc/init.d/cron restart >/dev/null 2>&1 || true
     fi
 
-    # 4. Remove conflicting and legacy packages
+    # 4. Remove conflicting and legacy packages + thorough sing-box purge
     for pkg in \
         luci-i18n-podkop-ru luci-i18n-podkop-en \
         luci-app-podkop podkop \
@@ -334,6 +453,7 @@ purge_old_podkop() {
         xray-example; do
         pkg_remove "$pkg"
     done
+    purge_singbox_everywhere
 
     # 5. Remove leftover directories and files
     rm -rf /etc/config/podkop-070 \
@@ -365,33 +485,14 @@ install_deps() {
     done
 }
 
-# Tag of the newest Xray-core release: stable, or including pre-releases with --xray-prerelease.
-# GitHub API first, then github.com pages (API rate limit for a shared IP).
-xray_latest_tag() {
-    local api_url="$XRAY_REPO" json tag=""
-    [ "$XRAY_MODE" = "prerelease" ] && api_url="$XRAY_RELEASES"
-    json="$(curl -fsSL -m 15 "$api_url" 2>/dev/null || true)"
-    tag="$(echo "$json" | jq -r 'if type == "array" then .[0].tag_name else .tag_name end // empty' 2>/dev/null || true)"
-    if [ -z "$tag" ]; then
-        if [ "$XRAY_MODE" = "prerelease" ]; then
-            tag="$(curl -fsSL -m 15 "https://github.com/XTLS/Xray-core/releases.atom" 2>/dev/null |
-                grep -o 'releases/tag/v[0-9][0-9.]*' | head -n1 | sed 's|releases/tag/||')"
-        else
-            tag="$(curl -sI -m 15 "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null | tr -d '\r' |
-                sed -n 's|^[Ll]ocation: .*/releases/tag/\(v[0-9][0-9.]*\).*|\1|p' | head -n1)"
-        fi
-    fi
-    echo "$tag"
-}
-
-# xray_fetch_binary <zip url | mirror:<asset name>> <file>: downloads the archive, extracts a complete, runnable xray binary
+# xray_fetch_binary <zip url | release:<asset name>> <file>: downloads the archive, extracts a complete, runnable xray binary
 xray_fetch_binary() {
     local url="$1" out="$2" tmp_zip="/tmp/xray.zip" want_size have_size
     rm -f "$tmp_zip" "$out"
     case "$url" in
-        mirror:*)
-            msg "Downloading Xray-core ${url#mirror:} from the podkop release..."
-            fetch_release_asset "${url#mirror:}" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
+        release:*)
+            msg "Downloading Xray-core ${url#release:} from the podkop release..."
+            fetch_release_asset "${url#release:}" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
             ;;
         *)
             msg "Downloading Xray-core from $url..."
@@ -415,36 +516,17 @@ xray_fetch_binary() {
     fi
 }
 
-# xray_download <zip arch> <file>: a working xray binary of the chosen version. Default: the release podkop is
-# tested with (XRAY_PINNED_VERSION); if XTLS removes it, the copy in our latest release (the release workflow
-# mirrors it), then the latest stable release.
+# xray_download <zip arch> <file>: a working xray binary of XRAY_VERSION, from our mirror (MIRROR_BASE) first,
+# then XTLS, then the copy in our release (the release workflow attaches it). No other version is ever installed.
 xray_download() {
-    local zip_arch="$1" out="$2" urls url tag_name
-    case "$XRAY_MODE" in
-        pinned)
-            msg "Xray-core version tested with podkop: $XRAY_PINNED_VERSION"
-            urls="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PINNED_VERSION}/Xray-linux-${zip_arch}.zip"
-            urls="$urls mirror:Xray-linux-${zip_arch}.zip latest"
-            ;;
-        version)
-            urls="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${zip_arch}.zip"
-            ;;
-        *)
-            urls="latest"
-            ;;
-    esac
+    local zip_arch="$1" out="$2" urls="" url
+    msg "Xray-core version: $XRAY_VERSION"
+    [ -n "$MIRROR_BASE" ] && urls="${MIRROR_BASE%/}/xray/${XRAY_VERSION}/Xray-linux-${zip_arch}.zip"
+    urls="$urls https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${zip_arch}.zip"
+    urls="$urls release:Xray-linux-${zip_arch}.zip"
     for url in $urls; do
-        # github.com is blocked: only the mirror (through api.github.com) can work
-        [ "$GITHUB_BLOCKED" -eq 1 ] && [ "${url#mirror:}" = "$url" ] && continue
-        if [ "$url" = "latest" ]; then
-            [ "$XRAY_MODE" = "pinned" ] && warn "Warning: Xray-core $XRAY_PINNED_VERSION is not available, installing the latest stable release"
-            tag_name="$(xray_latest_tag)"
-            if [ -n "$tag_name" ]; then
-                url="https://github.com/XTLS/Xray-core/releases/download/${tag_name}/Xray-linux-${zip_arch}.zip"
-            else
-                url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${zip_arch}.zip"
-            fi
-        fi
+        # github.com is blocked: skip direct https://github.com URLs
+        [ "$GITHUB_BLOCKED" -eq 1 ] && [ "${url#https://github.com/}" != "$url" ] && continue
         xray_fetch_binary "$url" "$out" && return 0
         warn "Warning: Xray-core is not available at $url"
     done
@@ -742,6 +824,13 @@ post_install() {
     echo ""
 }
 
+# Installed from a mirror: podkop keeps using it first for lists and Xray-core (settings.mirror_url)
+save_mirror_url() {
+    [ -n "$MIRROR_BASE" ] || return 0
+    uci -q set podkop.settings.mirror_url="$MIRROR_BASE"
+    uci -q commit podkop
+}
+
 main() {
     check_system
     confirm_wipe
@@ -749,10 +838,10 @@ main() {
     purge_old_podkop
     install_deps
     install_packages
+    save_mirror_url
     # after the packages: the xray-core dependency would overwrite a newer binary
     install_xray
     install_doh_proxy
-    [ "$XRAY_MODE" = "prerelease" ] && uci -q set podkop.settings.xray_prerelease='1' && uci -q commit podkop
     post_install
 }
 

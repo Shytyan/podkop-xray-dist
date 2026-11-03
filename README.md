@@ -10,9 +10,9 @@
 sh <(wget -O - https://raw.githubusercontent.com/Shytyan/podkop-xray-dist/main/install.sh)
 ```
 
-Установщик заменит старый podkop (копия настроек — `/etc/config/podkop.bak-<дата>`), поставит пакеты из последнего релиза и проверенную версию Xray-core.
+Установщик заменит старый podkop и любые сборки sing-box (копия настроек — `/etc/config/podkop.bak-<дата>`), поставит пакеты из последнего релиза и Xray-core `v26.10.31`.
 
-Если провайдер блокирует github.com, установщик сам скачает пакеты и Xray-core через api.github.com (с проверкой sha256).
+Если `github.com` недоступен, пакеты скачиваются через `api.github.com` с проверкой sha256.
 
 Параметры:
 
@@ -20,8 +20,6 @@ sh <(wget -O - https://raw.githubusercontent.com/Shytyan/podkop-xray-dist/main/i
 |---|---|
 | `-y` | без вопросов |
 | `--ru` | русский язык интерфейса |
-| `--xray-latest` | последняя стабильная версия Xray-core |
-| `--xray-version=X` | конкретная версия Xray-core |
 | `--no-doh-proxy` | без `https-dns-proxy` |
 
 Дальше: LuCI → Services → Podkop → ссылка на сервер → «Сохранить и применить».
