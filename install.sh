@@ -14,6 +14,7 @@ RELEASE_API="https://api.github.com/repos/Shytyan/podkop-xray-dist/releases/late
 RELEASE_JSON="/tmp/podkop_release.json"
 GITHUB_BLOCKED=0 # set once github.com fails and the api.github.com route works
 DOWNLOAD_DIR="/tmp/podkop_install"
+XRAY_TMP_BIN="/tmp/xray.new" # Xray-core downloaded in step 3b, installed in step 7
 REQUIRED_SPACE_KB=46080 # 45MB in KB
 NON_INTERACTIVE=0
 FORCE_RU=0
@@ -171,6 +172,15 @@ pkg_remove() {
     fi
 }
 
+# pkg_files <package>: absolute paths of the files of an installed package
+pkg_files() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk info -L "$1" 2>/dev/null
+    else
+        opkg files "$1" 2>/dev/null
+    fi | awk '/ contains:$/ || /following files:$/ || NF == 0 {next} { if (substr($0, 1, 1) != "/") $0 = "/" $0; print }'
+}
+
 pkg_list_installed() {
     if [ "$PKG_IS_APK" -eq 1 ]; then
         apk info 2>/dev/null || true
@@ -221,19 +231,7 @@ check_system() {
     fi
 
     # 5. Check free flash space
-    local avail_kb=0
-    if [ -d /overlay ]; then
-        avail_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')"
-    fi
-    if [ -z "$avail_kb" ] || [ "$avail_kb" -eq 0 ]; then
-        avail_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')"
-    fi
-
-    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$REQUIRED_SPACE_KB" ]; then
-        err "Error: Insufficient flash storage."
-        err "Available: $((avail_kb / 1024)) MB, Required: $((REQUIRED_SPACE_KB / 1024)) MB."
-        exit 1
-    fi
+    check_free_space
 
     # 6. Check DNS
     if ! nslookup github.com >/dev/null 2>&1 && ! nslookup api.github.com >/dev/null 2>&1; then
@@ -306,6 +304,69 @@ is_singbox_binary() {
     esac
     [ "$(head -c 4 "$f" 2>/dev/null)" = "$(printf '\177ELF')" ] || return 1
     grep -qa "sing-box" "$f" 2>/dev/null
+}
+
+# flash_avail_kb: free space on the overlay (or on / without an overlay), KB
+flash_avail_kb() {
+    local avail_kb=""
+    [ -d /overlay ] && avail_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [ -z "$avail_kb" ] || [ "$avail_kb" -eq 0 ]; then
+        avail_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')"
+    fi
+    echo "$avail_kb"
+}
+
+# reclaimable_kb: flash space (KB) the purge frees: files of the packages it removes (old podkop, sing-box of any
+# origin, xray-core), sing-box binaries outside packages and the old /usr/bin/xray (replaced). Each path counts once,
+# and only if it takes space on the overlay (its copy in /overlay/upper; files only in /rom free nothing).
+# https-dns-proxy is not counted: it is installed again. PODKOP_PURGE_ROOT: a fake root (tests).
+reclaimable_kb() {
+    local root="${PODKOP_PURGE_ROOT:-}" upper="" p d f
+    [ -d "$root/overlay/upper" ] && upper="$root/overlay/upper"
+    {
+        for p in $(pkg_list_installed); do
+            case "$p" in
+                podkop|luci-app-podkop|luci-i18n-podkop-*|xray-core|xray-example|*sing-box*|*singbox*) pkg_files "$p" ;;
+            esac
+        done
+        echo /usr/bin/xray
+        for d in /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt /root /sbin /bin; do
+            for f in "$root$d"/*; do
+                is_singbox_binary "$f" && echo "$d/${f##*/}"
+            done
+            [ -n "$upper" ] || continue
+            for f in "$upper$d"/*; do
+                is_singbox_binary "$f" && echo "$d/${f##*/}"
+            done
+        done
+    } | sort -u | {
+        local total=0 sz
+        while read -r p; do
+            f="${upper:-$root}$p"
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+            total=$((total + ${sz:-0}))
+        done
+        echo $((total / 1024))
+    }
+}
+
+# check_free_space: enough flash for the install, counting what the purge of old podkop / sing-box / xray frees.
+# Runs before anything is changed: not enough space -> exit, the router stays as it is.
+check_free_space() {
+    local avail_kb reclaim_kb=0 total_kb
+    avail_kb="$(flash_avail_kb)"
+    [ -n "$avail_kb" ] || return 0
+    [ "$avail_kb" -ge "$REQUIRED_SPACE_KB" ] && return 0
+    reclaim_kb="$(reclaimable_kb)"
+    total_kb=$((avail_kb + ${reclaim_kb:-0}))
+    if [ "$total_kb" -lt "$REQUIRED_SPACE_KB" ]; then
+        err "Error: Insufficient flash storage."
+        err "Available: $((avail_kb / 1024)) MB + $((reclaim_kb / 1024)) MB freed by removing old podkop/sing-box/xray = $((total_kb / 1024)) MB, Required: $((REQUIRED_SPACE_KB / 1024)) MB."
+        err "Nothing was changed on the router."
+        exit 1
+    fi
+    msg "Free flash: $((avail_kb / 1024)) MB + $((reclaim_kb / 1024)) MB freed by removing old podkop/sing-box/xray = $((total_kb / 1024)) MB (required $((REQUIRED_SPACE_KB / 1024)) MB)"
 }
 
 purge_singbox_everywhere() {
@@ -444,13 +505,15 @@ purge_old_podkop() {
         /etc/init.d/cron restart >/dev/null 2>&1 || true
     fi
 
-    # 4. Remove conflicting and legacy packages + thorough sing-box purge
+    # 4. Remove conflicting and legacy packages + thorough sing-box purge.
+    # xray-core (OpenWrt feed, older): podkop uses its own Xray-core binary (step 7); left installed, a package
+    # upgrade would put the old binary back. Removed after its dependents (podkop, xray-example).
     for pkg in \
         luci-i18n-podkop-ru luci-i18n-podkop-en \
         luci-app-podkop podkop \
         sing-box \
         https-dns-proxy luci-app-https-dns-proxy luci-i18n-https-dns-proxy-ru \
-        xray-example; do
+        xray-example xray-core; do
         pkg_remove "$pkg"
     done
     purge_singbox_everywhere
@@ -533,8 +596,10 @@ xray_download() {
     return 1
 }
 
-install_xray() {
-    info "==> Step 7: Installing Xray-core"
+# Downloads Xray-core (XRAY_VERSION) to XRAY_TMP_BIN BEFORE the old podkop is removed, like the packages: a failed
+# download leaves the router untouched. No xray-core package from the OpenWrt feed (an older version) is installed.
+fetch_xray() {
+    info "==> Step 3b: Downloading Xray-core"
 
     local arch zip_arch
     arch="$(uname -m)"
@@ -559,7 +624,7 @@ install_xray() {
             ;;
         *)
             err "Error: Unsupported CPU architecture '$arch' for Xray-core"
-            exit 1
+            download_failed
             ;;
     esac
 
@@ -570,18 +635,27 @@ install_xray() {
     tmp_free="$(df -k /tmp 2>/dev/null | awk 'NR==2 {print $4}')"
     if [ -n "$tmp_free" ] && [ "$tmp_free" -lt 61440 ]; then
         err "Error: not enough free space in /tmp for Xray-core: $((tmp_free / 1024)) MB, need 60 MB."
-        err "podkop is installed and uses the xray-core package binary; free /tmp and run: podkop update_xray"
-        exit 1
+        err "Nothing was changed on the router. Free /tmp (or reboot the router) and run the installer again."
+        download_failed
     fi
 
-    local tmp_bin="/tmp/xray.new" xray_ver
-    if ! xray_download "$zip_arch" "$tmp_bin"; then
+    if ! xray_download "$zip_arch" "$XRAY_TMP_BIN"; then
         err "Error: Failed to download a working Xray-core binary."
+        err "Nothing was changed on the router. Check the internet connection and try again."
+        download_failed
+    fi
+    msg "Xray-core $("$XRAY_TMP_BIN" version 2>/dev/null | head -n1 | awk '{print $2}') downloaded."
+}
+
+install_xray() {
+    info "==> Step 7: Installing Xray-core"
+    local xray_ver
+    if [ ! -s "$XRAY_TMP_BIN" ]; then
+        err "Error: the downloaded Xray-core binary $XRAY_TMP_BIN is gone (/tmp cleared?). Run: podkop update_xray"
         exit 1
     fi
-    xray_ver="$("$tmp_bin" version 2>/dev/null | head -n1 | awk '{print $2}')"
-
-    mv -f "$tmp_bin" /usr/bin/xray
+    xray_ver="$("$XRAY_TMP_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')"
+    mv -f "$XRAY_TMP_BIN" /usr/bin/xray
     msg "Installed Xray-core $xray_ver to /usr/bin/xray"
 
     # Ensure /etc/init.d/xray service script exists with GOMEMLIMIT & respawn
@@ -673,11 +747,36 @@ pkg_ext() {
     if [ "$PKG_IS_APK" -eq 1 ]; then echo apk; else echo ipk; fi
 }
 
+podkop_service() {
+    [ -x /etc/init.d/podkop ] && /etc/init.d/podkop "$@"
+}
+
+# The downloads go before the purge. While podkop runs, dnsmasq sends DNS to podkop's 127.0.0.42, and a broken podkop
+# (the usual reason to reinstall) answers only now and then, so a test lookup proves nothing. podkop is removed in
+# step 4 anyway: stop it for the downloads (dnsmasq goes back to the provider DNS); download_failed starts it again.
+PODKOP_STOPPED=0
+podkop_dns_bypass() {
+    uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q "127.0.0.42" || return 0
+    warn "Stopping podkop for the downloads: DNS goes through it (it is reinstalled anyway)"
+    podkop_service stop >/dev/null 2>&1 || true
+    PODKOP_STOPPED=1
+}
+
+# download_failed: a download before the purge failed -> start the podkop stopped for the downloads and exit
+download_failed() {
+    if [ "$PODKOP_STOPPED" -eq 1 ]; then
+        msg "Starting podkop again..."
+        podkop_service start >/dev/null 2>&1 || true
+    fi
+    exit 1
+}
+
 # Downloads the packages BEFORE the old podkop is removed: a failed download leaves the router untouched.
 # Release assets with fixed names are fetched via releases/latest/download (no GitHub API, no rate limit).
 fetch_packages() {
     info "==> Step 3: Downloading Podkop (Xray edition) Packages"
     local ext p
+    podkop_dns_bypass
     ext="$(pkg_ext)"
     rm -rf "$DOWNLOAD_DIR"
     mkdir -p "$DOWNLOAD_DIR"
@@ -698,7 +797,7 @@ fetch_packages() {
         err "Error: could not download podkop/luci-app-podkop packages from $RELEASE_DOWNLOAD (or through api.github.com)"
         err "Check that the router can open https://github.com and https://api.github.com (some ISPs block github.com)."
         err "Nothing was changed on the router. Check the internet connection and try again."
-        exit 1
+        download_failed
     fi
     msg "Packages downloaded."
 }
@@ -835,11 +934,11 @@ main() {
     check_system
     confirm_wipe
     fetch_packages
+    fetch_xray
     purge_old_podkop
     install_deps
     install_packages
     save_mirror_url
-    # after the packages: the xray-core dependency would overwrite a newer binary
     install_xray
     install_doh_proxy
     post_install
