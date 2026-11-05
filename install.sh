@@ -21,6 +21,11 @@ FORCE_RU=0
 # The Xray-core version podkop uses (see install_xray)
 XRAY_VERSION="v26.10.31"
 NO_DOH_PROXY=0
+# --reset: clean install even over podkop Xray edition; UPGRADE=1: update, the settings are kept (detect_upgrade)
+RESET=0
+UPGRADE=0
+PODKOP_WAS_ENABLED=0
+SAVED_CONFIG=""
 
 # ANSI colors
 c_green='\033[32;1m'
@@ -57,9 +62,13 @@ for arg in "$@"; do
         --no-doh-proxy)
             NO_DOH_PROXY=1
             ;;
+        --reset)
+            RESET=1
+            ;;
         -h|--help)
-            echo "Usage: sh install.sh [-y] [--ru]"
+            echo "Usage: sh install.sh [-y] [--ru] [--reset]"
             echo "  -y, --yes: Non-interactive mode (auto-confirm wipe and install)"
+            echo "  --reset:   Clean install with default settings even over podkop Xray edition (default: update, settings kept)"
             echo "  --no-doh-proxy: Do not install https-dns-proxy (DNS queries other than A/AAAA then go through the proxy to 1.1.1.1)"
             echo "  --ru:      Install the Russian language pack (luci-i18n-podkop-ru); with -y the default is English"
             exit 0
@@ -255,10 +264,69 @@ check_system() {
     msg "System validation passed."
 }
 
+# detect_upgrade: podkop Xray edition (ours) is installed and configured -> UPGRADE=1: the settings are kept.
+# The sing-box podkop (different config) and --reset -> clean install. PODKOP_PURGE_ROOT: a fake root (tests).
+detect_upgrade() {
+    local root="${PODKOP_PURGE_ROOT:-}" c="${PODKOP_PURGE_ROOT:-}/usr/lib/podkop/constants.sh"
+    UPGRADE=0
+    [ "$RESET" -eq 1 ] && return 0
+    [ -s "$root/etc/config/podkop" ] && [ -f "$c" ] || return 0
+    if grep -q '^PODKOP_VERSION=".*_Xray"' "$c" || grep -q '^XRAY_VERSION=' "$c"; then
+        UPGRADE=1
+    fi
+}
+
+# remember_podkop_state: was podkop enabled at boot before the installer touched it (the purge disables it);
+# an upgrade keeps the Russian interface (the purge removes luci-i18n-podkop-ru, -y would install English)
+remember_podkop_state() {
+    local f
+    PODKOP_WAS_ENABLED=0
+    for f in "${PODKOP_PURGE_ROOT:-}"/etc/rc.d/S*podkop; do
+        [ -e "$f" ] && PODKOP_WAS_ENABLED=1
+    done
+    if [ "$UPGRADE" -eq 1 ] && pkg_list_installed | grep -qx "luci-i18n-podkop-ru"; then
+        FORCE_RU=1
+    fi
+    return 0
+}
+
+# restore_config: upgrade -> the settings saved by the purge replace the package defaults
+restore_config() {
+    [ "$UPGRADE" -eq 1 ] && [ -s "$SAVED_CONFIG" ] || return 0
+    cp -f "$SAVED_CONFIG" "${PODKOP_PURGE_ROOT:-}/etc/config/podkop"
+    msg "Settings restored from $SAVED_CONFIG"
+}
+
+# start_after_upgrade: upgrade of an enabled podkop -> enabled and started with the kept settings
+start_after_upgrade() {
+    [ "$UPGRADE" -eq 1 ] && [ "$PODKOP_WAS_ENABLED" -eq 1 ] || return 0
+    info "==> Starting podkop with your settings"
+    podkop_service enable >/dev/null 2>&1 || true
+    podkop_service start >/dev/null 2>&1 || warn "Warning: podkop did not start, see: logread -e podkop"
+}
+
 confirm_wipe() {
     info "==> Step 2: Confirmation"
+    if [ "$UPGRADE" -eq 1 ]; then
+        msg "Podkop (Xray edition) is installed: UPDATE, your settings are kept (clean install: --reset)."
+        msg "Podkop (Xray edition) уже установлен: ОБНОВЛЕНИЕ, ваши настройки сохранятся (чистая установка: --reset)."
+    fi
     if [ "$NON_INTERACTIVE" -eq 1 ]; then
-        warn "Non-interactive mode: proceeding with full purge and installation."
+        if [ "$UPGRADE" -eq 1 ]; then
+            warn "Non-interactive mode: proceeding with the update."
+        else
+            warn "Non-interactive mode: proceeding with full purge and installation."
+        fi
+        return 0
+    fi
+
+    if [ "$UPGRADE" -eq 1 ]; then
+        printf "%bОбновить podkop? Введите 'yes' (Update podkop? Type 'yes'): %b" "$c_yellow" "$c_reset"
+        read -r ANSWER
+        case "$ANSWER" in
+            yes|Yes|YES|y|Y|да|Да|ДА) msg "Подтверждено / Confirmed. Продолжаем..." ;;
+            *) warn "Обновление отменено пользователем. Никаких изменений не внесено."; exit 0 ;;
+        esac
         return 0
     fi
 
@@ -477,12 +545,16 @@ purge_singbox_everywhere() {
 purge_old_podkop() {
     info "==> Step 4: Purging Old Podkop, Sing-box & Conflicting Components"
 
-    # Backup existing config and remove for clean default install
+    # Backup existing config and remove it (the package installs the defaults); an upgrade puts it back (restore_config)
     if [ -f /etc/config/podkop ]; then
-        local bak_path="/etc/config/podkop.bak-$(date +%Y%m%d-%H%M%S)"
-        cp -f /etc/config/podkop "$bak_path"
+        SAVED_CONFIG="/etc/config/podkop.bak-$(date +%Y%m%d-%H%M%S)"
+        cp -f /etc/config/podkop "$SAVED_CONFIG"
         rm -f /etc/config/podkop
-        msg "Current config backed up to $bak_path and reset to default"
+        if [ "$UPGRADE" -eq 1 ]; then
+            msg "Current config saved to $SAVED_CONFIG (restored after the update)"
+        else
+            msg "Current config backed up to $SAVED_CONFIG and reset to default"
+        fi
     fi
 
     # 1. Stop and disable podkop service
@@ -917,9 +989,18 @@ post_install() {
     info "• Веб-интерфейс: http://$(uci -q get network.lan.ipaddr || echo "192.168.1.1")/cgi-bin/luci/admin/services/podkop"
     echo ""
     warn "Если LuCI уже был открыт, обновите страницу с Ctrl+F5: браузер кеширует старый интерфейс."
-    warn "ВАЖНО: Служба Podkop не запущена автоматически."
-    warn "Для запуска откройте веб-интерфейс LuCI, добавьте Outbound (Single Link: VLESS/VMess/Trojan/SS)"
-    warn "и нажмите 'Сохранить и применить'."
+    if [ "$UPGRADE" -eq 1 ]; then
+        msg "Обновление: ваши настройки сохранены (копия: $SAVED_CONFIG)."
+        if [ "$PODKOP_WAS_ENABLED" -eq 1 ]; then
+            msg "Podkop запускается с вашими настройками."
+        else
+            warn "Podkop был выключен до обновления и остаётся выключенным: запустите его в LuCI."
+        fi
+    else
+        warn "ВАЖНО: Служба Podkop не запущена автоматически."
+        warn "Для запуска откройте веб-интерфейс LuCI, добавьте Outbound (Single Link: VLESS/VMess/Trojan/SS)"
+        warn "и нажмите 'Сохранить и применить'."
+    fi
     echo ""
 }
 
@@ -930,18 +1011,41 @@ save_mirror_url() {
     uci -q commit podkop
 }
 
+# Installed from a mirror: its private DoH servers (<mirror>/dns-presets.txt, one https URL per line) are offered in
+# the LuCI DNS lists (settings.dns_presets). No mirror or no file -> the settings stay as they are.
+save_dns_presets() {
+    [ -n "$MIRROR_BASE" ] || return 0
+    local f="/tmp/podkop_dns_presets.txt" url
+    fetch_file "${MIRROR_BASE%/}/dns-presets.txt" "$f" || { rm -f "$f"; return 0; }
+    # set -e: deleting an option that does not exist yet fails
+    uci -q delete podkop.settings.dns_presets || true
+    while read -r url; do
+        case "$url" in
+            https://*) uci -q add_list podkop.settings.dns_presets="$url" || true ;;
+        esac
+    done < "$f"
+    uci -q commit podkop || true
+    rm -f "$f"
+    msg "DoH servers of the mirror added to the DNS lists"
+}
+
 main() {
     check_system
+    detect_upgrade
+    remember_podkop_state
     confirm_wipe
     fetch_packages
     fetch_xray
     purge_old_podkop
     install_deps
     install_packages
+    restore_config
     save_mirror_url
+    save_dns_presets
     install_xray
     install_doh_proxy
     post_install
+    start_after_upgrade
 }
 
 # PODKOP_INSTALL_NO_MAIN=1: only define the functions (tools/test_install_xray.sh)
