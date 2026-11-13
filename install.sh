@@ -276,6 +276,18 @@ detect_upgrade() {
     fi
 }
 
+# inherit_mirror: an update started without a mirror keeps using the one the router was installed from
+# (settings.mirror_url): packages, Xray-core and the DoH presets come from it first, as before
+inherit_mirror() {
+    local saved
+    [ -z "$MIRROR_BASE" ] && [ "$UPGRADE" -eq 1 ] || return 0
+    saved="$(uci -q get podkop.settings.mirror_url 2>/dev/null || true)"
+    case "$saved" in
+        https://*) MIRROR_BASE="$saved"; msg "Mirror from the current settings is used first." ;;
+    esac
+    return 0
+}
+
 # remember_podkop_state: was podkop enabled at boot before the installer touched it (the purge disables it);
 # an upgrade keeps the Russian interface (the purge removes luci-i18n-podkop-ru, -y would install English)
 remember_podkop_state() {
@@ -320,13 +332,9 @@ confirm_wipe() {
         return 0
     fi
 
+    # An update keeps the settings and removes nothing of the user: no question (a clean install still asks)
     if [ "$UPGRADE" -eq 1 ]; then
-        printf "%bОбновить podkop? Введите 'yes' (Update podkop? Type 'yes'): %b" "$c_yellow" "$c_reset"
-        read -r ANSWER
-        case "$ANSWER" in
-            yes|Yes|YES|y|Y|да|Да|ДА) msg "Подтверждено / Confirmed. Продолжаем..." ;;
-            *) warn "Обновление отменено пользователем. Никаких изменений не внесено."; exit 0 ;;
-        esac
+        msg "Обновляем без вопросов / Updating, no questions asked."
         return 0
     fi
 
@@ -542,8 +550,47 @@ purge_singbox_everywhere() {
     fi
 }
 
+# purge_podkop_data: /etc/podkop. An upgrade keeps the downloaded lists and subscriptions (lists-cache,
+# subscriptions): without them the first start has no subnets, and no servers when the subscription host is down.
+# PODKOP_PURGE_ROOT: a fake root (tests).
+purge_podkop_data() {
+    local dir="${PODKOP_PURGE_ROOT:-}/etc/podkop" entry
+    [ -d "$dir" ] || return 0
+    if [ "$UPGRADE" -ne 1 ]; then
+        rm -rf "$dir"
+        return 0
+    fi
+    for entry in "$dir"/* "$dir"/.[!.]*; do
+        [ -e "$entry" ] || continue
+        case "${entry##*/}" in
+            lists-cache|subscriptions) ;;
+            *) rm -rf "$entry" ;;
+        esac
+    done
+    return 0
+}
+
+# Install marker (holds the time it was set): the package postinst starts podkop on the default config before the
+# kept settings are back; podkop does not start while a fresh marker is there (install_in_progress, /usr/bin/podkop).
+install_marker_set() {
+    date +%s > "${PODKOP_PURGE_ROOT:-}/tmp/podkop.installing"
+}
+
+install_marker_clear() {
+    rm -f "${PODKOP_PURGE_ROOT:-}/tmp/podkop.installing"
+}
+
 purge_old_podkop() {
     info "==> Step 4: Purging Old Podkop, Sing-box & Conflicting Components"
+
+    # 1. Stop and disable podkop service. Before its config is removed: a stop without the config cannot tell that
+    # dnsmasq is already given back and restarts it again. Already stopped for the downloads -> no second stop.
+    if [ -x /etc/init.d/podkop ]; then
+        if [ "$PODKOP_STOPPED" -ne 1 ]; then
+            /etc/init.d/podkop stop >/dev/null 2>&1 || true
+        fi
+        /etc/init.d/podkop disable >/dev/null 2>&1 || true
+    fi
 
     # Backup existing config and remove it (the package installs the defaults); an upgrade puts it back (restore_config)
     if [ -f /etc/config/podkop ]; then
@@ -555,12 +602,6 @@ purge_old_podkop() {
         else
             msg "Current config backed up to $SAVED_CONFIG and reset to default"
         fi
-    fi
-
-    # 1. Stop and disable podkop service
-    if [ -x /etc/init.d/podkop ]; then
-        /etc/init.d/podkop stop >/dev/null 2>&1 || true
-        /etc/init.d/podkop disable >/dev/null 2>&1 || true
     fi
 
     # 2. Cleanup nftables and routing
@@ -591,8 +632,8 @@ purge_old_podkop() {
     purge_singbox_everywhere
 
     # 5. Remove leftover directories and files
+    purge_podkop_data
     rm -rf /etc/config/podkop-070 \
-           /etc/podkop \
            /usr/lib/podkop \
            /usr/bin/podkop \
            /usr/bin/sing-box \
@@ -604,6 +645,7 @@ purge_old_podkop() {
            /usr/lib/lua/luci/i18n/podkop.*.lmo \
            /etc/uci-defaults/*podkop* \
            /tmp/podkop.run* /tmp/podkop_traffic* /tmp/podkop_test* /tmp/xray /tmp/sing-box /var/run/podkop* /etc/sing-box \
+           /tmp/podkop_xray_update* /tmp/podkop_xray_releases.json \
            /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
 
     msg "Purge completed."
@@ -892,6 +934,9 @@ install_packages() {
     local install_ru=0
     if [ "$FORCE_RU" -eq 1 ]; then
         install_ru=1
+    elif [ "$UPGRADE" -eq 1 ]; then
+        # an update asks nothing: the language stays as it was (FORCE_RU when the Russian package was installed)
+        install_ru=0
     elif [ "$NON_INTERACTIVE" -eq 0 ]; then
         msg "Русский язык интерфейса ставим? y/n (Install the Russian interface language?)"
         while true; do
@@ -1032,16 +1077,20 @@ save_dns_presets() {
 main() {
     check_system
     detect_upgrade
+    inherit_mirror
     remember_podkop_state
     confirm_wipe
     fetch_packages
     fetch_xray
     purge_old_podkop
     install_deps
+    trap install_marker_clear EXIT
+    install_marker_set
     install_packages
     restore_config
     save_mirror_url
     save_dns_presets
+    install_marker_clear
     install_xray
     install_doh_proxy
     post_install
